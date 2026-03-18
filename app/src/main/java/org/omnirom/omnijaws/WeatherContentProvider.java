@@ -15,7 +15,7 @@
  */
 package org.omnirom.omnijaws;
 
-import com.android.internal.util.crdroid.OmniJawsClient;
+import org.omnirom.omnijaws.client.OmniJawsClient;
 
 import org.omnirom.omnijaws.WeatherInfo.DayForecast;
 
@@ -32,11 +32,15 @@ public class WeatherContentProvider extends ContentProvider {
     private static final String TAG = "WeatherService:WeatherContentProvider";
     private static final boolean DEBUG = false;
 
-    static WeatherInfo sCachedWeatherInfo;
+    static volatile WeatherInfo sCachedWeatherInfo;
 
     private static final int URI_TYPE_WEATHER = 1;
     private static final int URI_TYPE_SETTINGS = 2;
     private static final int URI_TYPE_CONTROL = 3;
+    private static final int URI_TYPE_HOURLY = 4;
+
+    // km <-> miles, and km/h <-> mph
+    private static final float KM_PER_MILE = 1.609344f;
 
     private static final String COLUMN_CURRENT_CITY_ID = "city_id";
     private static final String COLUMN_CURRENT_CITY = "city";
@@ -49,11 +53,26 @@ public class WeatherContentProvider extends ContentProvider {
     private static final String COLUMN_CURRENT_CONDITION_CODE = "condition_code";
     private static final String COLUMN_CURRENT_PIN_WHEEL = "pin_wheel";
 
+    private static final String COLUMN_CURRENT_FEELS_LIKE = "feels_like";
+    private static final String COLUMN_CURRENT_PRESSURE = "pressure";
+    private static final String COLUMN_CURRENT_UVI = "uvi";
+    private static final String COLUMN_CURRENT_VISIBILITY = "visibility";
+    private static final String COLUMN_CURRENT_DEW_POINT = "dew_point";
+    private static final String COLUMN_CURRENT_SUNRISE = "sunrise";
+    private static final String COLUMN_CURRENT_SUNSET = "sunset";
+
     private static final String COLUMN_FORECAST_LOW = "forecast_low";
     private static final String COLUMN_FORECAST_HIGH = "forecast_high";
     private static final String COLUMN_FORECAST_CONDITION = "forecast_condition";
     private static final String COLUMN_FORECAST_CONDITION_CODE = "forecast_condition_code";
     private static final String COLUMN_FORECAST_DATE = "forecast_date";
+
+    private static final String COLUMN_HOURLY_TEMPERATURE = "hourly_temperature";
+    private static final String COLUMN_HOURLY_CONDITION_CODE = "hourly_condition_code";
+    private static final String COLUMN_HOURLY_CONDITION = "hourly_condition";
+    private static final String COLUMN_HOURLY_TIMESTAMP = "hourly_timestamp";
+    private static final String COLUMN_HOURLY_HUMIDITY = "hourly_humidity";
+    private static final String COLUMN_HOURLY_WIND_SPEED = "hourly_wind_speed";
 
     private static final String COLUMN_ENABLED = "enabled";
     private static final String COLUMN_PROVIDER = "provider";
@@ -62,6 +81,8 @@ public class WeatherContentProvider extends ContentProvider {
     private static final String COLUMN_LOCATION = "location";
     private static final String COLUMN_SETUP = "setup";
     private static final String COLUMN_ICON_PACK = "icon_pack";
+    private static final String COLUMN_UPDATE_ERROR = "update_error";
+    private static final String COLUMN_LAST_UPDATE = "last_update";
 
     public static final String COLUMN_FORCE_REFRESH = "update";
 
@@ -76,6 +97,13 @@ public class WeatherContentProvider extends ContentProvider {
             COLUMN_CURRENT_TIME_STAMP,
             COLUMN_CURRENT_PIN_WHEEL,
             COLUMN_CURRENT_CONDITION_CODE,
+            COLUMN_CURRENT_FEELS_LIKE,
+            COLUMN_CURRENT_PRESSURE,
+            COLUMN_CURRENT_UVI,
+            COLUMN_CURRENT_VISIBILITY,
+            COLUMN_CURRENT_DEW_POINT,
+            COLUMN_CURRENT_SUNRISE,
+            COLUMN_CURRENT_SUNSET,
             COLUMN_FORECAST_LOW,
             COLUMN_FORECAST_HIGH,
             COLUMN_FORECAST_CONDITION,
@@ -90,7 +118,18 @@ public class WeatherContentProvider extends ContentProvider {
             COLUMN_UNITS,
             COLUMN_LOCATION,
             COLUMN_SETUP,
-            COLUMN_ICON_PACK
+            COLUMN_ICON_PACK,
+            COLUMN_UPDATE_ERROR,
+            COLUMN_LAST_UPDATE
+    };
+
+    private static final String[] PROJECTION_DEFAULT_HOURLY = new String[] {
+            COLUMN_HOURLY_TEMPERATURE,
+            COLUMN_HOURLY_CONDITION_CODE,
+            COLUMN_HOURLY_CONDITION,
+            COLUMN_HOURLY_TIMESTAMP,
+            COLUMN_HOURLY_HUMIDITY,
+            COLUMN_HOURLY_WIND_SPEED
     };
 
     public static final String AUTHORITY = "org.omnirom.omnijaws.provider";
@@ -101,6 +140,7 @@ public class WeatherContentProvider extends ContentProvider {
         sUriMatcher.addURI(AUTHORITY, "weather", URI_TYPE_WEATHER);
         sUriMatcher.addURI(AUTHORITY, "settings", URI_TYPE_SETTINGS);
         sUriMatcher.addURI(AUTHORITY, "control", URI_TYPE_CONTROL);
+        sUriMatcher.addURI(AUTHORITY, "hourly", URI_TYPE_HOURLY);
     }
 
     private Context mContext;
@@ -126,6 +166,8 @@ public class WeatherContentProvider extends ContentProvider {
         if (DEBUG) Log.i(TAG, "query: " + uri.toString());
 
         if (projectionType == URI_TYPE_SETTINGS) {
+            final String iconPack = Config.getIconPack(mContext);
+
             result.newRow()
                     .add(COLUMN_ENABLED, Config.isEnabled(mContext) ? 1 : 0)
                     .add(COLUMN_PROVIDER, Config.getProviderId(mContext))
@@ -133,38 +175,97 @@ public class WeatherContentProvider extends ContentProvider {
                     .add(COLUMN_UNITS, Config.isMetric(mContext) ? 0 : 1)
                     .add(COLUMN_LOCATION, Config.isCustomLocation(mContext) ? Config.getLocationName(mContext) : "")
                     .add(COLUMN_SETUP, !Config.isSetupDone(mContext) && sCachedWeatherInfo == null ? 0 : 1)
-                    .add(COLUMN_ICON_PACK, Config.getIconPack(mContext) != null ? Config.getIconPack(mContext) : "");
+                    .add(COLUMN_ICON_PACK, iconPack)
+                    .add(COLUMN_UPDATE_ERROR, Config.isUpdateError(mContext) ? 1 : 0)
+                    .add(COLUMN_LAST_UPDATE, Config.getLastUpdateTime(mContext));
 
             return result;
         } else if (projectionType == URI_TYPE_WEATHER) {
             WeatherInfo weather = sCachedWeatherInfo;
             if (weather != null) {
+                final boolean from = weather.isMetric();
+                final boolean to = Config.isMetric(mContext);
+
+                if (DEBUG && from != to) {
+                    Log.i(TAG, "converting cached data from "
+                            + (from ? "metric" : "imperial") + " to "
+                            + (to ? "metric" : "imperial"));
+                }
+
                 // current
                 result.newRow()
                         .add(COLUMN_CURRENT_CITY, weather.getCity())
                         .add(COLUMN_CURRENT_CITY_ID, weather.getId())
                         .add(COLUMN_CURRENT_CONDITION, weather.getCondition())
                         .add(COLUMN_CURRENT_HUMIDITY, weather.getFormattedHumidity())
-                        .add(COLUMN_CURRENT_WIND_SPEED, weather.getWindSpeed())
+                        .add(COLUMN_CURRENT_WIND_SPEED, convertSpeed(weather.getWindSpeed(), from, to))
                         .add(COLUMN_CURRENT_WIND_DIRECTION, weather.getWindDirection())
-                        .add(COLUMN_CURRENT_TEMPERATURE, weather.getTemperature())
+                        .add(COLUMN_CURRENT_TEMPERATURE, convertTemp(weather.getTemperature(), from, to))
                         .add(COLUMN_CURRENT_TIME_STAMP, weather.getTimestamp().toString())
                         .add(COLUMN_CURRENT_PIN_WHEEL, weather.getPinWheel())
-                        .add(COLUMN_CURRENT_CONDITION_CODE, weather.getConditionCode());
+                        .add(COLUMN_CURRENT_CONDITION_CODE, weather.getConditionCode())
+                        .add(COLUMN_CURRENT_FEELS_LIKE, convertTemp(weather.getFeelsLike(), from, to))
+                        .add(COLUMN_CURRENT_PRESSURE, weather.getPressure())
+                        .add(COLUMN_CURRENT_UVI, weather.getUvi())
+                        .add(COLUMN_CURRENT_VISIBILITY, convertDistance(weather.getVisibility(), from, to))
+                        .add(COLUMN_CURRENT_DEW_POINT, convertTemp(weather.getDewPoint(), from, to))
+                        .add(COLUMN_CURRENT_SUNRISE, weather.getSunrise())
+                        .add(COLUMN_CURRENT_SUNSET, weather.getSunset());
 
                 // forecast
                 for (DayForecast day : weather.getForecasts()) {
                     result.newRow()
                             .add(COLUMN_FORECAST_CONDITION, day.getCondition(mContext))
-                            .add(COLUMN_FORECAST_LOW, day.getLow())
-                            .add(COLUMN_FORECAST_HIGH, day.getHigh())
+                            .add(COLUMN_FORECAST_LOW, convertTemp(day.getLow(), from, to))
+                            .add(COLUMN_FORECAST_HIGH, convertTemp(day.getHigh(), from, to))
                             .add(COLUMN_FORECAST_CONDITION_CODE, day.getConditionCode())
                             .add(COLUMN_FORECAST_DATE, day.date);
                 }
                 return result;
             }
+        } else if (projectionType == URI_TYPE_HOURLY) {
+            WeatherInfo weather = sCachedWeatherInfo;
+            if (weather != null && weather.getHourlyForecasts() != null) {
+                final boolean from = weather.isMetric();
+                final boolean to = Config.isMetric(mContext);
+
+                for (WeatherInfo.HourlyForecast h : weather.getHourlyForecasts()) {
+                    result.newRow()
+                            .add(COLUMN_HOURLY_TEMPERATURE, convertTemp(h.temperature, from, to))
+                            .add(COLUMN_HOURLY_CONDITION_CODE, h.conditionCode)
+                            .add(COLUMN_HOURLY_CONDITION, h.getCondition(mContext))
+                            .add(COLUMN_HOURLY_TIMESTAMP, h.timestamp)
+                            .add(COLUMN_HOURLY_HUMIDITY, h.humidity)
+                            .add(COLUMN_HOURLY_WIND_SPEED, convertSpeed(h.windSpeed, from, to));
+                }
+                return result;
+            }
         }
         return null;
+    }
+
+    /** degC <-> degF. */
+    private static float convertTemp(float value, boolean fromMetric, boolean toMetric) {
+        if (fromMetric == toMetric || Float.isNaN(value)) {
+            return value;
+        }
+        return toMetric ? (value - 32f) / 1.8f : (value * 1.8f) + 32f;
+    }
+
+    /** km/h <-> mph. */
+    private static float convertSpeed(float value, boolean fromMetric, boolean toMetric) {
+        if (fromMetric == toMetric || Float.isNaN(value)) {
+            return value;
+        }
+        return toMetric ? value * KM_PER_MILE : value / KM_PER_MILE;
+    }
+
+    /** km <-> miles. */
+    private static float convertDistance(float value, boolean fromMetric, boolean toMetric) {
+        if (fromMetric == toMetric || Float.isNaN(value)) {
+            return value;
+        }
+        return toMetric ? value * KM_PER_MILE : value / KM_PER_MILE;
     }
 
     private String[] resolveProjection(String[] projection, int uriType) {
@@ -177,6 +278,9 @@ public class WeatherContentProvider extends ContentProvider {
 
             case URI_TYPE_SETTINGS:
                 return PROJECTION_DEFAULT_SETTINGS;
+
+            case URI_TYPE_HOURLY:
+                return PROJECTION_DEFAULT_HOURLY;
         }
     }
 
@@ -212,5 +316,14 @@ public class WeatherContentProvider extends ContentProvider {
         sCachedWeatherInfo = Config.getWeatherData(context);
         context.getContentResolver().notifyChange(
                 Uri.parse("content://" + WeatherContentProvider.AUTHORITY + "/weather"), null);
+    }
+
+    public static void notifySettingsChanged(Context context) {
+        context.getContentResolver().notifyChange(
+                Uri.parse("content://" + WeatherContentProvider.AUTHORITY + "/settings"), null);
+        context.getContentResolver().notifyChange(
+                Uri.parse("content://" + WeatherContentProvider.AUTHORITY + "/weather"), null);
+        context.getContentResolver().notifyChange(
+                Uri.parse("content://" + WeatherContentProvider.AUTHORITY + "/hourly"), null);
     }
 }

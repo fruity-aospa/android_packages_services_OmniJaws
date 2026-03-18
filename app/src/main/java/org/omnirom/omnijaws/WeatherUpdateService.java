@@ -26,23 +26,25 @@ import android.app.job.JobService;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.location.Criteria;
 import android.location.Location;
 import android.location.LocationManager;
+import android.os.CancellationSignal;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.provider.Settings;
-import android.text.TextUtils;
 import android.util.Log;
+
+import androidx.preference.PreferenceManager;
 
 import org.omnirom.omnijaws.widget.WeatherAppWidgetProvider;
 
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
 
 // we dont need an explicit wakelock JobScheduler takes care of that
 public class WeatherUpdateService extends JobService {
@@ -58,28 +60,38 @@ public class WeatherUpdateService extends JobService {
 
     private static final float LOCATION_ACCURACY_THRESHOLD_METERS = 50000;
     private static final long OUTDATED_LOCATION_THRESHOLD_MILLIS = 10L * 60L * 1000L; // 10 minutes
+    private static final long FUSED_TIMEOUT_MS = 10L * 1000L;
+    private static final long NETWORK_TIMEOUT_MS = 10L * 1000L;
+    private static final long GPS_TIMEOUT_MS = 30L * 1000L;
+    private static final long LOCATION_TOTAL_BUDGET_MS = 45L * 1000L;
     private static final int RETRY_DELAY_MS = 5000;
     private static final int RETRY_MAX_NUM = 5;
+
+    private static final String PREF_KEY_DATA_SOURCE = "weather_data_source";
+    private static final String SOURCE_CURRENT = "current";
+    private static final String SOURCE_CUSTOM_PREFIX = "custom:";
 
     public static final int PERIODIC_UPDATE_JOB_ID = 0;
     public static final int ONCE_UPDATE_JOB_ID = 1;
 
     private HandlerThread mHandlerThread;
     private Handler mHandler;
+    private volatile CancellationSignal mLocationCancellationSignal;
     private static final SimpleDateFormat dayFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US);
-
-    private static final Criteria sLocationCriteria;
-    static {
-        sLocationCriteria = new Criteria();
-        sLocationCriteria.setPowerRequirement(Criteria.POWER_LOW);
-        sLocationCriteria.setAccuracy(Criteria.ACCURACY_COARSE);
-        sLocationCriteria.setCostAllowed(false);
-    }
 
     @Override
     public boolean onStopJob(JobParameters params) {
         if (DEBUG) Log.d(TAG, "onStopJob " + params.getJobId());
+        CancellationSignal signal = mLocationCancellationSignal;
+        if (signal != null) {
+            signal.cancel();
+        }
         return true;
+    }
+
+    @Override
+    public void onNetworkChanged(JobParameters params) {
+        if (DEBUG) Log.d(TAG, "onNetworkChanged " + params.getJobId());
     }
 
     @Override
@@ -108,80 +120,220 @@ public class WeatherUpdateService extends JobService {
     private void updateWeatherFromAlarm(JobParameters params) {
         Config.setUpdateError(this, false);
 
-        try {
-            if (!Config.isEnabled(this)) {
-                Log.w(TAG, "Service started, but not enabled ... stopping");
-                Intent errorIntent = new Intent(ACTION_ERROR);
-                errorIntent.putExtra(EXTRA_ERROR, EXTRA_ERROR_DISABLED);
-                sendBroadcast(errorIntent);
-                return;
-            }
-
-            Config.clearLastUpdateTime(this);
-
-            Log.d(TAG, "updateWeather");
-            updateWeather();
-        } finally {
+        if (!Config.isEnabled(this)) {
+            Log.w(TAG, "Service started, but not enabled ... stopping");
+            Intent errorIntent = new Intent(ACTION_ERROR);
+            errorIntent.putExtra(EXTRA_ERROR, EXTRA_ERROR_DISABLED);
+            sendBroadcast(errorIntent);
             jobFinished(params, false);
+            return;
+        }
+
+        Config.clearLastUpdateTime(this);
+
+        Log.d(TAG, "updateWeather");
+        updateWeather(params);
+    }
+
+    private static SharedPreferences prefs(Context context) {
+        return PreferenceManager.getDefaultSharedPreferences(context);
+    }
+
+    private static String currentLocationSource(Context context) {
+        return Config.isCustomLocation(context)
+                ? SOURCE_CUSTOM_PREFIX + Config.getLocationId(context)
+                : SOURCE_CURRENT;
+    }
+
+    private static String currentSource(Context context) {
+        String provider = prefs(context).getString(Config.PREF_KEY_PROVIDER, "1");
+        return "provider=" + provider + ";" + currentLocationSource(context);
+    }
+
+    public static boolean isCachedDataForOtherSource(Context context) {
+        String stored = prefs(context).getString(PREF_KEY_DATA_SOURCE, null);
+        if (stored == null) return false;
+        if (!stored.startsWith("provider=")) {
+            return !stored.equals(currentLocationSource(context));
+        }
+        return !stored.equals(currentSource(context));
+    }
+
+    public static void ensureDataSourceRecorded(Context context) {
+        SharedPreferences prefs = prefs(context);
+        String stored = prefs.getString(PREF_KEY_DATA_SOURCE, null);
+        if (stored == null) {
+            prefs.edit().putString(PREF_KEY_DATA_SOURCE, currentSource(context)).commit();
+        } else if (!stored.startsWith("provider=")) {
+            String provider = prefs.getString(Config.PREF_KEY_PROVIDER, "1");
+            prefs.edit().putString(PREF_KEY_DATA_SOURCE,
+                    "provider=" + provider + ";" + stored).commit();
         }
     }
 
     private boolean doCheckLocationEnabled() {
-        return Settings.Secure.getInt(getContentResolver(), Settings.Secure.LOCATION_MODE, -1) != Settings.Secure.LOCATION_MODE_OFF;
+        LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        if (lm == null) {
+            return false;
+        }
+        return lm.isLocationEnabled();
     }
 
     @SuppressLint("MissingPermission")
     private Location getCurrentLocation() {
         LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         if (!doCheckLocationEnabled()) {
-            Log.w(TAG, "locations disabled");
+            Log.w(TAG, "location services are OFF on the device");
             return null;
         }
-        Location location = lm.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER);
-        if (DEBUG) Log.d(TAG, "Current location is " + location);
 
-        if (location != null && location.getAccuracy() > LOCATION_ACCURACY_THRESHOLD_METERS) {
-            Log.w(TAG, "Ignoring inaccurate location");
-            location = null;
-        }
+        Location location = getBestLastKnownLocation(lm);
+        Log.d(TAG, "getCurrentLocation: best last known = " + describe(location));
 
-        // If lastKnownLocation is not present (because none of the apps in the
-        // device has requested the current location to the system yet) or outdated,
-        // then try to get the current location use the provider that best matches the criteria.
+        // Use a recent, accurate last-known fix as-is (weather doesn't change
+        // meaningfully over a few minutes / a short distance). Only pay for a
+        // fresh fix when we have nothing usable.
         boolean needsUpdate = location == null;
         if (location != null) {
-            long delta = System.currentTimeMillis() - location.getTime();
-            needsUpdate = delta > OUTDATED_LOCATION_THRESHOLD_MILLIS;
-            if (needsUpdate) {
-                Log.w(TAG, "Ignoring too old location from " + dayFormat.format(location.getTime()));
-                location = null;
-            }
-        }
-        if (needsUpdate) {
-            String locationProvider = lm.getBestProvider(sLocationCriteria, true);
-            if (TextUtils.isEmpty(locationProvider)) {
-                Log.e(TAG, "No available location providers matching criteria.");
+            if (location.getAccuracy() > LOCATION_ACCURACY_THRESHOLD_METERS) {
+                Log.w(TAG, "Ignoring inaccurate last known location");
+                needsUpdate = true;
             } else {
-                if (DEBUG) Log.d(TAG, "Getting current location with provider " + locationProvider);
-                lm.getCurrentLocation(locationProvider, null, getApplication().getMainExecutor(), new Consumer<Location>() {
-                    @Override
-                    public void accept(Location location) {
-                        if (location != null) {
-                            if (DEBUG) Log.d(TAG, "Got valid location now update");
-                            WeatherUpdateService.scheduleUpdateNow(WeatherUpdateService.this);
-                        } else {
-                            Log.w(TAG, "Failed to retrieve location");
-                            Intent errorIntent = new Intent(ACTION_ERROR);
-                            errorIntent.putExtra(EXTRA_ERROR, EXTRA_ERROR_LOCATION);
-                            sendBroadcast(errorIntent);
-                            Config.setUpdateError(WeatherUpdateService.this, true);
-                        }
-                    }
-                });
+                long delta = System.currentTimeMillis() - location.getTime();
+                if (delta > OUTDATED_LOCATION_THRESHOLD_MILLIS) {
+                    Log.w(TAG, "Last known location is too old (" + dayFormat.format(location.getTime()) + ")");
+                    needsUpdate = true;
+                }
             }
         }
 
+        Log.d(TAG, "getCurrentLocation: needsFreshFix = " + needsUpdate);
+
+        if (needsUpdate) {
+            Location fresh = requestFreshLocation(lm);
+            if (fresh != null) {
+                location = fresh;
+            } else {
+                Log.w(TAG, "Could not obtain a fresh location"
+                        + (location != null ? ", falling back to last known" : ""));
+                // location stays as the (possibly stale) last known, or null.
+            }
+        }
+
+        Log.d(TAG, "getCurrentLocation: returning " + describe(location));
         return location;
+    }
+
+    private static String describe(Location l) {
+        if (l == null) return "null";
+        return l.getProvider() + " (" + l.getLatitude() + "," + l.getLongitude()
+                + ") acc=" + l.getAccuracy() + "m age="
+                + ((System.currentTimeMillis() - l.getTime()) / 1000) + "s";
+    }
+
+    @SuppressLint("MissingPermission")
+    private Location getBestLastKnownLocation(LocationManager lm) {
+        Location best = null;
+        List<String> providers = lm.getProviders(true);
+        for (String provider : providers) {
+            try {
+                Location l = lm.getLastKnownLocation(provider);
+                if (l == null) {
+                    continue;
+                }
+                if (l.getAccuracy() > LOCATION_ACCURACY_THRESHOLD_METERS) {
+                    continue;
+                }
+                if (best == null || l.getTime() > best.getTime()) {
+                    best = l;
+                }
+            } catch (SecurityException | IllegalArgumentException e) {
+                // provider not usable, skip
+            }
+        }
+        return best;
+    }
+
+    private Location requestFreshLocation(LocationManager lm) {
+        final long deadline = System.currentTimeMillis() + LOCATION_TOTAL_BUDGET_MS;
+        final String[] candidates = {
+                LocationManager.FUSED_PROVIDER,
+                LocationManager.NETWORK_PROVIDER,
+                LocationManager.GPS_PROVIDER
+        };
+        final long[] timeouts = { FUSED_TIMEOUT_MS, NETWORK_TIMEOUT_MS, GPS_TIMEOUT_MS };
+
+        boolean triedAny = false;
+        for (int i = 0; i < candidates.length; i++) {
+            String provider = candidates[i];
+            if (!isProviderUsable(lm, provider)) {
+                Log.d(TAG, "Provider '" + provider + "' not available or disabled, skipping");
+                continue;
+            }
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                Log.w(TAG, "Location budget used up before trying '" + provider + "'");
+                break;
+            }
+            triedAny = true;
+            Location fix = requestCurrentLocationBlocking(lm, provider, Math.min(timeouts[i], remaining));
+            if (fix != null && fix.getAccuracy() <= LOCATION_ACCURACY_THRESHOLD_METERS) {
+                return fix;
+            }
+        }
+
+        if (!triedAny) {
+            Log.e(TAG, "No usable location provider (fused/network/gps). Check that the ROM "
+                    + "binds a network location provider (config_locationProviderPackageNames).");
+        }
+        return null;
+    }
+
+    private static boolean isProviderUsable(LocationManager lm, String provider) {
+        try {
+            return lm.hasProvider(provider) && lm.isProviderEnabled(provider);
+        } catch (IllegalArgumentException | SecurityException e) {
+            return false;
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private Location requestCurrentLocationBlocking(LocationManager lm, String provider, long timeoutMs) {
+        Log.d(TAG, "Requesting fresh location from '" + provider + "' (timeout " + timeoutMs + " ms)");
+
+        final CountDownLatch latch = new CountDownLatch(1);
+        final Location[] result = new Location[1];
+        final CancellationSignal cancel = new CancellationSignal();
+        mLocationCancellationSignal = cancel;
+
+        try {
+            lm.getCurrentLocation(provider, cancel, getMainExecutor(), location -> {
+                if (DEBUG) Log.d(TAG, "getCurrentLocation callback: " + describe(location));
+                result[0] = location;
+                latch.countDown();
+            });
+        } catch (SecurityException | IllegalArgumentException e) {
+            Log.e(TAG, "getCurrentLocation failed for '" + provider + "'", e);
+            mLocationCancellationSignal = null;
+            return null;
+        }
+
+        try {
+            if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                Log.w(TAG, "Timed out after " + timeoutMs + " ms waiting for a fix from '"
+                        + provider + "'");
+                cancel.cancel();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            cancel.cancel();
+        } finally {
+            mLocationCancellationSignal = null;
+        }
+        if (result[0] == null) {
+            Log.w(TAG, "No fix from '" + provider + "'");
+        }
+        return result[0];
     }
 
     public static void scheduleUpdatePeriodic(Context context) {
@@ -219,13 +371,22 @@ public class WeatherUpdateService extends JobService {
         if (DEBUG) Log.d(TAG, "scheduleUpdateNow");
 
         ComponentName component = new ComponentName(context, WeatherUpdateService.class);
-        JobInfo job = new JobInfo.Builder(ONCE_UPDATE_JOB_ID, component)
-                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-                .setMinimumLatency(1)
-                .setOverrideDeadline(1)
-                .build();
         JobScheduler jobScheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
-        jobScheduler.schedule(job);
+
+        JobInfo expedited = new JobInfo.Builder(ONCE_UPDATE_JOB_ID, component)
+                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                .setExpedited(true)
+                .build();
+
+        int result = jobScheduler.schedule(expedited);
+        if (result != JobScheduler.RESULT_SUCCESS) {
+            if (DEBUG) Log.d(TAG, "expedited schedule failed, using normal job");
+            JobInfo normal = new JobInfo.Builder(ONCE_UPDATE_JOB_ID, component)
+                    .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                    .setOverrideDeadline(TimeUnit.SECONDS.toMillis(30))
+                    .build();
+            jobScheduler.schedule(normal);
+        }
     }
 
     private static void cancelUpdate(Context context) {
@@ -249,42 +410,55 @@ public class WeatherUpdateService extends JobService {
         context.sendBroadcast(errorIntent);
     }
 
-    private void updateWeather() {
+    private void updateWeather(final JobParameters params) {
         mHandler.post(new Runnable() {
             @Override
             public void run() {
+                final Context ctx = WeatherUpdateService.this;
+                final String source = currentSource(ctx);
                 WeatherInfo w = null;
+                boolean locationError = false;
                 try {
-                    AbstractWeatherProvider provider = Config.getProvider(WeatherUpdateService.this);
+                    AbstractWeatherProvider provider = Config.getProvider(ctx);
                     int i = 0;
-                    // retry max 3 times
+                    // retry max RETRY_MAX_NUM times
                     while (i < RETRY_MAX_NUM) {
-                        if (!Config.isCustomLocation(WeatherUpdateService.this)) {
+                        if (!Config.isCustomLocation(ctx)) {
                             if (checkPermissions()) {
                                 Location location = getCurrentLocation();
                                 if (location != null) {
-                                    w = provider.getLocationWeather(location, Config.isMetric(WeatherUpdateService.this));
+                                    w = provider.getLocationWeather(location, Config.isMetric(ctx));
                                 } else {
-                                    Log.w(TAG, "no location yet");
+                                    Log.w(TAG, "no location available (background location granted="
+                                            + (checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                                                    == PackageManager.PERMISSION_GRANTED) + ")");
+                                    locationError = true;
                                     // we are outa here
                                     break;
                                 }
                             } else {
-                                Log.w(TAG, "no location permissions");
+                                Log.w(TAG, "no location permission granted (FINE="
+                                        + (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED)
+                                        + " COARSE="
+                                        + (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED)
+                                        + ")");
+                                locationError = true;
                                 // we are outa here
                                 break;
                             }
-                        } else if (Config.getLocationId(WeatherUpdateService.this) != null) {
-                            w = provider.getCustomWeather(Config.getLocationId(WeatherUpdateService.this), Config.isMetric(WeatherUpdateService.this));
+                        } else if (Config.getLocationId(ctx) != null) {
+                            w = provider.getCustomWeather(Config.getLocationId(ctx), Config.isMetric(ctx));
                         } else {
                             Log.w(TAG, "no valid custom location");
+                            locationError = true;
                             // we are outa here
                             break;
                         }
                         if (w != null) {
-                            Config.setWeatherData(WeatherUpdateService.this, w);
-                            WeatherContentProvider.updateCachedWeatherInfo(WeatherUpdateService.this);
-                            WeatherAppWidgetProvider.updateAllWidgets(WeatherUpdateService.this);
+                            Config.setWeatherData(ctx, w);
+                            prefs(ctx).edit().putString(PREF_KEY_DATA_SOURCE, source).commit();
+                            WeatherContentProvider.updateCachedWeatherInfo(ctx);
+                            WeatherAppWidgetProvider.updateAllWidgets(ctx);
                             // we are outa here
                             break;
                         } else {
@@ -303,23 +477,33 @@ public class WeatherUpdateService extends JobService {
                     }
                 } finally {
                     if (w == null) {
-                        // error
-                        Log.d(TAG, "clear weather data");
-                        Config.setUpdateError(WeatherUpdateService.this, true);
-                        Config.clearWeatherData(WeatherUpdateService.this);
-                        WeatherContentProvider.updateCachedWeatherInfo(WeatherUpdateService.this);
-                        WeatherAppWidgetProvider.updateAllWidgets(WeatherUpdateService.this);
+                        Config.setUpdateError(ctx, true);
+                        if (isCachedDataForOtherSource(ctx)) {
+                            Log.d(TAG, "clearing weather data of previous provider/location");
+                            Config.clearWeatherData(ctx);
+                            prefs(ctx).edit().remove(PREF_KEY_DATA_SOURCE).commit();
+                        }
+                        WeatherContentProvider.updateCachedWeatherInfo(ctx);
+                        WeatherAppWidgetProvider.updateAllWidgets(ctx);
+                        if (locationError) {
+                            Intent errorIntent = new Intent(ACTION_ERROR);
+                            errorIntent.putExtra(EXTRA_ERROR, EXTRA_ERROR_LOCATION);
+                            sendBroadcast(errorIntent);
+                        }
                     }
                     // send broadcast that something has changed
                     Intent updateIntent = new Intent(ACTION_BROADCAST);
                     sendBroadcast(updateIntent);
+                    if (params != null) {
+                        jobFinished(params, false);
+                    }
                 }
             }
         });
     }
 
     private boolean checkPermissions() {
-        return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
+        return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
                 checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
     }
 }

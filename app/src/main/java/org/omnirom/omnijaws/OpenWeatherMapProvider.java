@@ -41,13 +41,9 @@ public class OpenWeatherMapProvider extends AbstractWeatherProvider {
             "https://api.openweathermap.org/data/3.0/onecall?%s&mode=json&units=%s&lang=%s&cnt=" + FORECAST_DAYS + "&appid=%s";
 
     private List<String> mKeys = new ArrayList<String>();
-    private boolean mHasAPIKey;
-    private int mRequestNumber;
 
     public OpenWeatherMapProvider(Context context) {
         super(context);
-        loadKeys();
-        mHasAPIKey = getAPIKey() != null;
     }
 
     public WeatherInfo getCustomWeather(String id, boolean metric) {
@@ -60,14 +56,15 @@ public class OpenWeatherMapProvider extends AbstractWeatherProvider {
     }
 
     private WeatherInfo handleWeatherRequest(String selection, boolean metric) {
-        if (!mHasAPIKey) {
+        String apiKey = Config.getOwmKey(mContext);
+        if (TextUtils.isEmpty(apiKey)) {
             log(TAG, "no API key provided");
             return null;
         }
-        mRequestNumber++;
+
         String units = metric ? "metric" : "imperial";
         String locale = getLanguageCode();
-        String conditionUrl = String.format(Locale.US, URL_WEATHER, selection, units, locale, getAPIKey());
+        String conditionUrl = String.format(Locale.US, URL_WEATHER, selection, units, locale, apiKey);
         String conditionResponse = retrieve(conditionUrl);
         if (conditionResponse == null) {
             return null;
@@ -89,7 +86,7 @@ public class OpenWeatherMapProvider extends AbstractWeatherProvider {
             String city = getWeatherDataLocality(selection);
 
             WeatherInfo w = new WeatherInfo(mContext, selection, city,
-                    /* condition */ weather.getString("main"),
+                    /* condition */ "",
                     /* conditionCode */ mapConditionIconToCode(
                     weather.getString("icon"), weather.getInt("id")),
                     /* temperature */ sanitizeTemperature(conditionData.getDouble("temp"), metric),
@@ -99,6 +96,38 @@ public class OpenWeatherMapProvider extends AbstractWeatherProvider {
                     metric,
                     forecasts,
                     System.currentTimeMillis());
+
+            if (conditionData.has("feels_like")) {
+                w.setFeelsLike(sanitizeTemperature(conditionData.getDouble("feels_like"), metric));
+            }
+            if (conditionData.has("pressure")) {
+                w.setPressure((float) conditionData.getDouble("pressure"));
+            }
+            if (conditionData.has("uvi")) {
+                w.setUvi((float) conditionData.getDouble("uvi"));
+            }
+            if (conditionData.has("visibility")) {
+                float vis = (float) conditionData.getDouble("visibility");
+                w.setVisibility(metric ? vis / 1000f : vis / 1609.34f);
+            }
+            if (conditionData.has("dew_point")) {
+                w.setDewPoint(sanitizeTemperature(conditionData.getDouble("dew_point"), metric));
+            }
+
+            JSONArray dailyArray = conditions.getJSONArray("daily");
+            if (dailyArray.length() > 0) {
+                JSONObject today = dailyArray.getJSONObject(0);
+                if (today.has("sunrise")) {
+                    w.setSunrise(today.getLong("sunrise") * 1000L);
+                }
+                if (today.has("sunset")) {
+                    w.setSunset(today.getLong("sunset") * 1000L);
+                }
+            }
+
+            if (conditions.has("hourly")) {
+                w.setHourlyForecasts(parseHourlyForecasts(conditions.getJSONArray("hourly"), metric));
+            }
 
             log(TAG, "Weather updated: " + w);
             return w;
@@ -127,20 +156,14 @@ public class OpenWeatherMapProvider extends AbstractWeatherProvider {
                 item = new DayForecast(
                         /* low */ sanitizeTemperature(conditionData.getDouble("min"), metric),
                         /* high */ sanitizeTemperature(conditionData.getDouble("max"), metric),
-                        /* condition */ data.getString("main"),
+                        /* condition */ "",
                         /* conditionCode */ mapConditionIconToCode(
                         data.getString("icon"), data.getInt("id")),
                         day,
                         metric);
             } catch (JSONException e) {
-                Log.w(TAG, "Invalid forecast for day " + i + " creating dummy", e);
-                item = new DayForecast(
-                        /* low */ 0,
-                        /* high */ 0,
-                        /* condition */ "",
-                        /* conditionCode */ -1,
-                        "NaN",
-                        metric);
+                Log.w(TAG, "Invalid forecast for day " + i, e);
+                continue;
             }
             result.add(item);
         }
@@ -156,6 +179,32 @@ public class OpenWeatherMapProvider extends AbstractWeatherProvider {
                         "NaN",
                         metric);
                 result.add(item);
+            }
+        }
+        return result;
+    }
+
+    private ArrayList<WeatherInfo.HourlyForecast> parseHourlyForecasts(JSONArray hourly, boolean metric) {
+        ArrayList<WeatherInfo.HourlyForecast> result = new ArrayList<>();
+        int count = Math.min(hourly.length(), 24);
+        for (int i = 0; i < count; i++) {
+            try {
+                JSONObject hour = hourly.getJSONObject(i);
+                JSONObject hourWeather = hour.getJSONArray("weather").getJSONObject(0);
+                float hWindSpeed = (float) hour.getDouble("wind_speed");
+                if (metric) {
+                    hWindSpeed *= 3.6f;
+                }
+                result.add(new WeatherInfo.HourlyForecast(
+                        sanitizeTemperature(hour.getDouble("temp"), metric),
+                        mapConditionIconToCode(hourWeather.getString("icon"), hourWeather.getInt("id")),
+                        "",
+                        hour.getLong("dt") * 1000L,
+                        (float) hour.getDouble("humidity"),
+                        hWindSpeed,
+                        metric));
+            } catch (JSONException e) {
+                Log.w(TAG, "Invalid hourly forecast for index " + i, e);
             }
         }
         return result;
@@ -270,7 +319,8 @@ public class OpenWeatherMapProvider extends AbstractWeatherProvider {
                 return 41; // heavy snow
             case 611:
             case 612:
-                return 18; // sleet
+            case 613:
+                return 18; // sleet (incl. shower sleet)
             case 615:
             case 616:
                 return 5;  // rain and snow
@@ -322,41 +372,6 @@ public class OpenWeatherMapProvider extends AbstractWeatherProvider {
         }
 
         return -1;
-    }
-
-    private void loadKeys() {
-        try {
-            String key = mContext.getResources().getString(R.string.owm_api_key_1);
-            if (!TextUtils.isEmpty(key)) {
-                mKeys.add(key);
-            }
-        } catch (Resources.NotFoundException e) {
-        }
-        try {
-            String key = mContext.getResources().getString(R.string.owm_api_key_2);
-            if (!TextUtils.isEmpty(key)) {
-                mKeys.add(key);
-            }
-        } catch (Resources.NotFoundException e) {
-        }
-        log(TAG, "use API keys = " + mKeys);
-    }
-
-    private String getAPIKey() {
-        String customKey = Config.getOwmKey(mContext);
-        if (!TextUtils.isEmpty(customKey)) {
-            return customKey;
-        }
-        if (mKeys.size() > 0) {
-            int key = mRequestNumber % mKeys.size();
-            log(TAG, "use API key = " + key);
-            return mKeys.get(key);
-        }
-        try {
-            return mContext.getResources().getString(R.string.owm_api_key);
-        } catch (Resources.NotFoundException e) {
-        }
-        return null;
     }
 
     public boolean shouldRetry() {

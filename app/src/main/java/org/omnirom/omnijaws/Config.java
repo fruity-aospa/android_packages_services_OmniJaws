@@ -22,6 +22,8 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 
+import org.omnirom.omnijaws.icon.IconProvider;
+
 import androidx.preference.PreferenceManager;
 
 public class Config {
@@ -35,10 +37,17 @@ public class Config {
     public static final String PREF_KEY_ENABLE = "enable";
     public static final String PREF_KEY_UPDATE_INTERVAL = "update_interval";
     public static final String PREF_KEY_ICON_PACK = "icon_pack";
+    public static final String PREF_KEY_ICON_THEME = "app_icon_theme";
     public static final String PREF_KEY_UPDATE_ERROR = "update_error";
     public static final String PREF_KEY_OWM_KEY = "owm_key";
+    public static final String PREF_KEY_PIRATE_WEATHER_KEY = "pirate_weather_key";
+    public static final String PREF_KEY_VISUAL_CROSSING_KEY = "visual_crossing_key";
     public static final String PREF_KEY_HISTORY = "history";
     public static final String PREF_KEY_HISTORY_SIZE = "history_size";
+
+    public static final String DEFAULT_ICON_PACK = "org.omnirom.omnijaws.google_new";
+    private static final String LEGACY_DEFAULT_ICON_PACK =
+            "org.omnirom.omnijaws.google_new_light";
 
     public static AbstractWeatherProvider getProvider(Context context) {
         SharedPreferences prefs = PreferenceManager
@@ -49,6 +58,12 @@ public class Config {
                 return new OpenWeatherMapProvider(context);
             case "1":
                 return new METNorwayProvider(context);
+            case "2":
+                return new PirateWeatherProvider(context);
+            case "3":
+                return new OpenMeteoProvider(context);
+            case "4":
+                return new VisualCrossingProvider(context);
             default:
                 return new OpenWeatherMapProvider(context);
         }
@@ -64,6 +79,12 @@ public class Config {
                 return "OpenWeatherMap";
             case "1":
                 return "MET Norway";
+            case "2":
+                return "Pirate Weather";
+            case "3":
+                return "Open-Meteo";
+            case "4":
+                return "Visual Crossing";
             default:
                 return "OpenWeatherMap";
         }
@@ -164,7 +185,9 @@ public class Config {
         SharedPreferences prefs = PreferenceManager
                 .getDefaultSharedPreferences(context);
 
-        return prefs.edit().putBoolean(PREF_KEY_ENABLE, value).commit();
+        boolean changed = prefs.edit().putBoolean(PREF_KEY_ENABLE, value).commit();
+        WeatherContentProvider.notifySettingsChanged(context);
+        return changed;
     }
 
     public static int getUpdateInterval(Context context) {
@@ -179,14 +202,37 @@ public class Config {
         SharedPreferences prefs = PreferenceManager
                 .getDefaultSharedPreferences(context);
 
-        return prefs.getString(PREF_KEY_ICON_PACK, null);
+        return normalizeIconPack(prefs.getString(PREF_KEY_ICON_PACK, DEFAULT_ICON_PACK));
     }
 
     public static void setIconPack(Context context, String value) {
         SharedPreferences prefs = PreferenceManager
                 .getDefaultSharedPreferences(context);
 
-        prefs.edit().putString(PREF_KEY_ICON_PACK, value).commit();
+        prefs.edit().putString(PREF_KEY_ICON_PACK, normalizeIconPack(value)).commit();
+        WeatherContentProvider.notifySettingsChanged(context);
+    }
+
+    public static String normalizeIconPack(String value) {
+        if (value == null || value.isEmpty() || LEGACY_DEFAULT_ICON_PACK.equals(value)) {
+            return DEFAULT_ICON_PACK;
+        }
+        return value;
+    }
+
+    public static int getIconTheme(Context context) {
+        SharedPreferences prefs = PreferenceManager
+                .getDefaultSharedPreferences(context);
+
+        return prefs.getInt(PREF_KEY_ICON_THEME, IconProvider.ICON_THEME_DEFAULT);
+    }
+
+    public static void setIconTheme(Context context, int value) {
+        SharedPreferences prefs = PreferenceManager
+                .getDefaultSharedPreferences(context);
+
+        prefs.edit().putInt(PREF_KEY_ICON_THEME, value).commit();
+        WeatherContentProvider.notifySettingsChanged(context);
     }
 
     public static boolean isUpdateError(Context context) {
@@ -204,11 +250,16 @@ public class Config {
     }
 
     public static boolean isSetupDone(Context context) {
-        if (context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
-                == PackageManager.PERMISSION_GRANTED) {
-            return true;
+        if (isCustomLocation(context)) {
+            String locationId = getLocationId(context);
+            return locationId != null && !locationId.isEmpty();
         }
-        return false;
+        boolean foreground = context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED
+                || context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
+        return foreground && context.checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
     }
 
     public static String getOwmKey(Context context) {
@@ -216,6 +267,20 @@ public class Config {
                 .getDefaultSharedPreferences(context);
 
         return prefs.getString(PREF_KEY_OWM_KEY, null);
+    }
+
+    public static String getPirateWeatherKey(Context context) {
+        SharedPreferences prefs = PreferenceManager
+                .getDefaultSharedPreferences(context);
+
+        return prefs.getString(PREF_KEY_PIRATE_WEATHER_KEY, null);
+    }
+
+    public static String getVisualCrossingKey(Context context) {
+        SharedPreferences prefs = PreferenceManager
+                .getDefaultSharedPreferences(context);
+
+        return prefs.getString(PREF_KEY_VISUAL_CROSSING_KEY, null);
     }
 
     public static boolean isHistoryOn(Context context) {

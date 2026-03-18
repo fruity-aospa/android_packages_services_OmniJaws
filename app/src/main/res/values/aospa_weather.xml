@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<resources>
+    <string name="provider_openmeteo" translatable="false">Open-Meteo</string>
+    <string name="weather_location_access_title">Location for weather</string>
+    <string name="weather_location_access_summary">Allow location for background updates, or choose a custom city</string>
+    <string name="weather_location_access_ready">Location access is ready for background updates</string>
+    <string name="weather_location_access_settings">Open app permissions</string>
+    <string name="weather_background_location_message">For automatic weather updates, open Permissions, choose Location, and select “%1$s”. You can also use a custom city without location permission.</string>
+</resources>

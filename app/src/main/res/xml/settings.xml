@@ -68,6 +68,13 @@
         android:dependency="enable" />
 
     <Preference
+        android:key="weather_location_access"
+        android:title="@string/weather_location_access_title"
+        android:summary="@string/weather_location_access_summary"
+        android:dependency="enable"
+        android:persistent="false" />
+
+    <Preference
         android:key="weather_custom_location"
         android:title="@string/weather_custom_location_title"
         android:dependency="custom_location"

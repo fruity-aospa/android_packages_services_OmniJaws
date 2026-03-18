@@ -27,10 +27,11 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.os.Bundle;
 import android.os.Handler;
+import android.net.Uri;
 import android.provider.Settings;
 import android.text.TextUtils;
 
-import com.android.internal.util.crdroid.OmniJawsClient;
+import org.omnirom.omnijaws.client.OmniJawsClient;
 import com.android.settingslib.widget.MainSwitchPreference;
 import com.android.settingslib.widget.SettingsBasePreferenceFragment;
 
@@ -62,7 +63,7 @@ public class SettingsFragment extends SettingsBasePreferenceFragment implements 
         OmniJawsClient.OmniJawsObserver {
 
     private static final String CHRONUS_ICON_PACK_INTENT = "com.dvtonder.chronus.ICON_PACK";
-    private static final String DEFAULT_WEATHER_ICON_PACKAGE = "org.omnirom.omnijaws.google_new_light";
+    private static final String DEFAULT_WEATHER_ICON_PACKAGE = "org.omnirom.omnijaws.google_new";
 
     private SharedPreferences mPrefs;
     private ListPreference mProvider;
@@ -77,6 +78,7 @@ public class SettingsFragment extends SettingsBasePreferenceFragment implements 
     protected boolean mShowIconPack = true;
     private EditTextPreference mOwmKey;
     private Preference mCustomLocationActivity;
+    private Preference mLocationAccess;
     private static final String PREF_KEY_CUSTOM_LOCATION = "weather_custom_location";
     private static final String WEATHER_ICON_PACK = "weather_icon_pack";
     private static final String PREF_KEY_UPDATE_STATUS = "update_status";
@@ -106,10 +108,19 @@ public class SettingsFragment extends SettingsBasePreferenceFragment implements 
                                 Manifest.permission.ACCESS_COARSE_LOCATION, false);
                         if ((fineLocationGranted != null && fineLocationGranted) ||
                                 (coarseLocationGranted != null && coarseLocationGranted)) {
-                            forceRefreshWeatherSettings();
+                            checkLocationPermissions(true);
                         }
+                        updateLocationAccess();
                     }
             );
+
+    ActivityResultLauncher<Intent> mLocationAccessLauncher = registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(), result -> {
+                updateLocationAccess();
+                if (Config.isSetupDone(getContext())) {
+                    forceRefreshWeatherSettings();
+                }
+            });
 
     @Override
     public void onCreatePreferences(Bundle savedInstanceState, String rootKey) {
@@ -172,11 +183,6 @@ public class SettingsFragment extends SettingsBasePreferenceFragment implements 
         mUpdateInterval.setValueIndex(idx);
         mUpdateInterval.setSummary(mUpdateInterval.getEntries()[idx]);
 
-        if (mPrefs.getBoolean(Config.PREF_KEY_ENABLE, false)
-                && !mPrefs.getBoolean(Config.PREF_KEY_CUSTOM_LOCATION, false)) {
-            checkLocationEnabled();
-        }
-
         mWeatherIconPack = (ListPreference) findPreference(WEATHER_ICON_PACK);
 
         if (mShowIconPack) {
@@ -210,6 +216,8 @@ public class SettingsFragment extends SettingsBasePreferenceFragment implements 
 
         mCustomLocationActivity = findPreference(PREF_KEY_CUSTOM_LOCATION);
         mCustomLocationActivity.setSummary(Config.getLocationName(getContext()));
+        mLocationAccess = findPreference("weather_location_access");
+        updateLocationAccess();
     }
 
     @Override
@@ -238,7 +246,11 @@ public class SettingsFragment extends SettingsBasePreferenceFragment implements 
             if (!mCustomLocation.isChecked()) {
                 checkLocationEnabled();
             }
+            updateLocationAccess();
             forceRefreshWeatherSettings();
+            return true;
+        } else if (preference == mLocationAccess) {
+            checkLocationEnabledInitial();
             return true;
         } else if (preference == mUpdateStatus) {
             forceRefreshWeatherSettings();
@@ -312,20 +324,44 @@ public class SettingsFragment extends SettingsBasePreferenceFragment implements 
         dialog.show();
     }
 
+    private void updateLocationAccess() {
+        if (mLocationAccess == null) return;
+        mLocationAccess.setVisible(!Config.isCustomLocation(getContext()));
+        mLocationAccess.setSummary(Config.isSetupDone(getContext())
+                ? R.string.weather_location_access_ready : R.string.weather_location_access_summary);
+    }
+
     private void checkLocationPermissions(boolean force) {
-        if (getContext().checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
-                != PackageManager.PERMISSION_GRANTED || getContext().checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
-                != PackageManager.PERMISSION_GRANTED) {
+        boolean foreground = getContext().checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED
+                || getContext().checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
+        if (!foreground) {
             requestPermissionLauncher.launch(new String[]{
                     Manifest.permission.ACCESS_FINE_LOCATION,
                     Manifest.permission.ACCESS_COARSE_LOCATION
             });
+        } else if (getContext().checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            // Android 11+ grants background access in app settings after foreground access.
+            new AlertDialog.Builder(getContext())
+                    .setTitle(R.string.weather_location_access_title)
+                    .setMessage(getString(R.string.weather_background_location_message,
+                            getContext().getPackageManager().getBackgroundPermissionOptionLabel()))
+                    .setPositiveButton(R.string.weather_location_access_settings, (dialog, which) -> {
+                        Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.fromParts("package", getContext().getPackageName(), null));
+                        mLocationAccessLauncher.launch(intent);
+                    })
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .show();
         } else {
             if (force) {
                 forceRefreshWeatherSettings();
             }
             queryAndUpdateWeather();
         }
+        updateLocationAccess();
     }
 
     private boolean doCheckLocationEnabled() {
@@ -366,7 +402,7 @@ public class SettingsFragment extends SettingsBasePreferenceFragment implements 
         i.setAction("org.omnirom.WeatherIconPack");
         for (ResolveInfo r : packageManager.queryIntentActivities(i, 0)) {
             String packageName = r.activityInfo.packageName;
-            if (packageName.equals(DEFAULT_WEATHER_ICON_PACKAGE)) {
+            if (r.activityInfo.name.equals(DEFAULT_WEATHER_ICON_PACKAGE)) {
                 values.add(0, r.activityInfo.name);
             } else {
                 values.add(r.activityInfo.name);
@@ -375,7 +411,7 @@ public class SettingsFragment extends SettingsBasePreferenceFragment implements 
             if (label == null) {
                 label = r.activityInfo.packageName;
             }
-            if (packageName.equals(DEFAULT_WEATHER_ICON_PACKAGE)) {
+            if (r.activityInfo.name.equals(DEFAULT_WEATHER_ICON_PACKAGE)) {
                 entries.add(0, label);
             } else {
                 entries.add(label);
