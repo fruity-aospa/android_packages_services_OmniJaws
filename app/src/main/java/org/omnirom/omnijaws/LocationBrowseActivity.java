@@ -67,11 +67,16 @@ public class LocationBrowseActivity extends CollapsingToolbarBaseActivity {
     private ExecutorService mExecutorService = Executors.newSingleThreadExecutor();
     private Handler mHandler = new Handler();
     private String mQueryString;
+    private volatile int mQueryId;
+    private volatile boolean mDestroyed;
 
     private Runnable mQueryRunnable = new Runnable() {
         @Override
         public void run() {
-            mExecutorService.submit(() -> getLocations(mQueryString));
+            if (mDestroyed) return;
+            String query = mQueryString;
+            int queryId = mQueryId;
+            mExecutorService.submit(() -> getLocations(query, queryId));
         }
     };
 
@@ -176,6 +181,7 @@ public class LocationBrowseActivity extends CollapsingToolbarBaseActivity {
             public void onTextChanged(CharSequence s, int start, int before, int count) {
                 mHandler.removeCallbacks(mQueryRunnable);
                 mQueryString = s.toString();
+                mQueryId++;
                 if (TextUtils.isEmpty(mQueryString)) {
                     hideProgress();
                     mLocationBrowseList.clear();
@@ -209,8 +215,9 @@ public class LocationBrowseActivity extends CollapsingToolbarBaseActivity {
         return super.onOptionsItemSelected(item);
     }
 
-    protected void getLocations(String input) {
-        mLocationBrowseList.clear();
+    protected void getLocations(String input, int queryId) {
+        if (mDestroyed || queryId != mQueryId) return;
+        List<LocationBrowseItem> locations = new ArrayList<>();
 
         try {
             String lang = Locale.getDefault().getLanguage().replaceFirst("_", "-");
@@ -236,11 +243,15 @@ public class LocationBrowseActivity extends CollapsingToolbarBaseActivity {
                     String cityExt = (TextUtils.isEmpty(adminName) ? "" : adminName + ", ") + country;
                     double lat = result.getDouble("lat");
                     double lon = result.getDouble("lng");
+                    if (!Double.isFinite(lat) || !Double.isFinite(lon)
+                            || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+                        continue;
+                    }
 
                     LocationBrowseItem locationItem = new LocationBrowseItem(cityExt, countryId, city, lat, lon);
-                    if (!mLocationBrowseList.contains(locationItem)) {
-                        mLocationBrowseList.add(locationItem);
-                        if (mLocationBrowseList.size() == 5) {
+                    if (!locations.contains(locationItem)) {
+                        locations.add(locationItem);
+                        if (locations.size() == 5) {
                             break;
                         }
                     }
@@ -250,10 +261,21 @@ public class LocationBrowseActivity extends CollapsingToolbarBaseActivity {
             Log.e(TAG, "Received malformed location data input=" + input, e);
         } finally {
             mHandler.post(() -> {
+                if (mDestroyed || queryId != mQueryId) return;
+                mLocationBrowseList = locations;
                 hideProgress();
                 mAdapter.notifyDataSetChanged();
             });
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+        mDestroyed = true;
+        mQueryId++;
+        mHandler.removeCallbacksAndMessages(null);
+        mExecutorService.shutdownNow();
+        super.onDestroy();
     }
 
     private void showProgress() {
